@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 
 import cv2
+import copy
 import numpy as np
 import pandas as pd
 import torch
@@ -797,7 +798,7 @@ def non_max_suppression_kpt(prediction, conf_thres=0.25, iou_thres=0.45, classes
     return output
 
 
-def strip_optimizer(f='best.pt', s=''):  # from utils.general import *; strip_optimizer()
+def strip_optimizer(model, f='best.pt', s=''):  # from utils.general import *; strip_optimizer()
     # Strip optimizer from 'f' to finalize training, optionally save as 's'
     x = torch.load(f, map_location=torch.device('cpu'))
     if x.get('ema'):
@@ -805,9 +806,17 @@ def strip_optimizer(f='best.pt', s=''):  # from utils.general import *; strip_op
     for k in 'optimizer', 'training_results', 'wandb_id', 'ema', 'updates':  # keys
         x[k] = None
     x['epoch'] = -1
-    x['model'].half()  # to FP16
-    for p in x['model'].parameters():
-        p.requires_grad = False
+    
+    if isinstance(x['model'], dict):
+        model_copy = copy.deepcopy(model)
+        model_copy.load_state_dict(x['model'])
+        model_copy.half()
+        for p in model_copy.parameters():
+            p.requires_grad = False
+    else:
+        x['model'].half()  # to FP16
+        for p in x['model'].parameters():
+            p.requires_grad = False
     torch.save(x, s or f)
     mb = os.path.getsize(s or f) / 1E6  # filesize
     print(f"Optimizer stripped from {f},{(' saved as %s,' % s) if s else ''} {mb:.1f}MB")

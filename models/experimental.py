@@ -5,6 +5,7 @@ import torch.nn as nn
 
 from models.common import Conv, DWConv
 from utils.google_utils import attempt_download
+from utils.pattern_utils import add_mask, conv2d_forward_with_mask
 
 
 class CrossConv(nn.Module):
@@ -244,14 +245,32 @@ class End2End(nn.Module):
 
 
 
-def attempt_load(weights, map_location=None):
+def attempt_load(origin_model, weights, map_location=None):
     # Loads an ensemble of models weights=[a,b,c] or a single model weights=[a] or weights=a
     model = Ensemble()
+    # add_mask(model)
+    # print('type(weights):')
+    # print(type(weights))
+    # print('model:')
+    # print(model)
     for w in weights if isinstance(weights, list) else [weights]:
-        attempt_download(w)
+        # attempt_download(w)
         ckpt = torch.load(w, map_location=map_location)  # load
-        model.append(ckpt['ema' if ckpt.get('ema') else 'model'].float().fuse().eval())  # FP32 model
-    
+        # print('mask exist in checkpoint or not:')
+        # print([k for k in ckpt['model'].state_dict().keys() if 'mask' in k])
+        # model.append(ckpt['ema' if ckpt.get('ema') else 'model'].float().fuse().eval())  # FP32 model
+        # model.append(ckpt['ema' if ckpt.get('ema') else 'model'].float().eval())
+        if ckpt.get('ema'):
+            print('get ema')
+            origin_model.load_state_dict(ckpt['ema'])
+            
+        else:
+            print('get model')
+            # model = torch.load(ckpt['model']).float().eval()
+            origin_model.load_state_dict(ckpt['model'])
+            
+        model.append(origin_model)
+        model.float().eval()
     # Compatibility updates
     for m in model.modules():
         if type(m) in [nn.Hardswish, nn.LeakyReLU, nn.ReLU, nn.ReLU6, nn.SiLU]:

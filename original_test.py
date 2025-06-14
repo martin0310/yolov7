@@ -6,20 +6,16 @@ from threading import Thread
 
 import numpy as np
 import torch
-import torch.nn as nn
 import yaml
 from tqdm import tqdm
 
 from models.experimental import attempt_load
-from models.yolo import Model
 from utils.datasets import create_dataloader
 from utils.general import coco80_to_coco91_class, check_dataset, check_file, check_img_size, check_requirements, \
     box_iou, non_max_suppression, scale_coords, xyxy2xywh, xywh2xyxy, set_logging, increment_path, colorstr
 from utils.metrics import ap_per_class, ConfusionMatrix
 from utils.plots import plot_images, output_to_target, plot_study_txt
 from utils.torch_utils import select_device, time_synchronized, TracedModel
-from utils.pattern_utils import add_mask, count_mask_layer
-from check_pattern import check_pattern_layer, check_block_pattern
 
 
 def test(data,
@@ -58,23 +54,13 @@ def test(data,
         save_dir = Path(increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok))  # increment run
         (save_dir / 'labels' if save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # make dir
 
-        model = Model('cfg/training/yolov7.yaml', ch=3, nc=80, anchors=None).to(device)  # create
-        add_mask(model)
         # Load model
-        print('model:')
-        print(model)
-        model = attempt_load(model, weights, map_location=device)  # load FP32 model
-        print('count_mask_layer(model):')
-        print(count_mask_layer(model))
+        model = attempt_load(weights, map_location=device)  # load FP32 model
         gs = max(int(model.stride.max()), 32)  # grid size (max stride)
         imgsz = check_img_size(imgsz, s=gs)  # check img_size
         
-        # if trace:
-        #     print('trace:')
-        #     print(trace)
-        #     model = TracedModel(model, device, imgsz)
-        #     print('count_mask_layer(model):')
-        #     print(count_mask_layer(model))
+        if trace:
+            model = TracedModel(model, device, imgsz)
 
     # Half
     half = device.type != 'cpu' and half_precision  # half precision only supported on CUDA
@@ -298,7 +284,7 @@ def test(data,
     maps = np.zeros(nc) + map
     for i, c in enumerate(ap_class):
         maps[c] = ap[i]
-    return (mp, mr, map50, map, *(loss.cpu() / len(dataloader)).tolist()), maps, t, model
+    return (mp, mr, map50, map, *(loss.cpu() / len(dataloader)).tolist()), maps, t
 
 
 if __name__ == '__main__':
@@ -330,7 +316,7 @@ if __name__ == '__main__':
     #check_requirements()
 
     if opt.task in ('train', 'val', 'test'):  # run normally
-        _, _, _, model = test(opt.data,
+        test(opt.data,
              opt.weights,
              opt.batch_size,
              opt.img_size,
@@ -359,15 +345,9 @@ if __name__ == '__main__':
             y = []  # y axis
             for i in x:  # img-size
                 print(f'\nRunning {f} point {i}...')
-                r, _, t, model = test(opt.data, w, opt.batch_size, i, opt.conf_thres, opt.iou_thres, opt.save_json,
+                r, _, t = test(opt.data, w, opt.batch_size, i, opt.conf_thres, opt.iou_thres, opt.save_json,
                                plots=False, v5_metric=opt.v5_metric)
                 y.append(r + t)  # results and times
             np.savetxt(f, y, fmt='%10.4g')  # save
         os.system('zip -r study.zip study_*.txt')
         plot_study_txt(x=x)  # plot
-        
-    model = model.cpu()
-    print('model:')
-    print(model)
-    check_pattern_layer(model, 4)
-    check_block_pattern(model, 4)

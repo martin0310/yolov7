@@ -9,6 +9,9 @@ from pathlib import Path
 from threading import Thread
 
 import numpy as np
+import torch
+torch.backends.cudnn.enabled = False
+
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
@@ -34,22 +37,28 @@ from utils.loss import ComputeLoss, ComputeLossOTA
 from utils.plots import plot_images, plot_labels, plot_results, plot_evolution
 from utils.torch_utils import ModelEMA, select_device, intersect_dicts, torch_distributed_zero_first, is_parallel
 from utils.wandb_logging.wandb_utils import WandbLogger, check_wandb_resume
-from utils.pattern_utils import conv2d_forward_with_mask, add_mask, count_mask_layer, state_dict_half
-from check_pattern import check_pattern_layer, check_block_pattern
+from utils.pattern_utils import conv2d_forward_with_mask, add_mask, N_prune, layer_pattern, block_pattern_prune, \
+    count_divisible, find_nonstandard_convs, find_convs_num, __getstate__, __setstate__, count_mask_layer, state_dict_half, \
+    get_N_cfg, get_pr_cfg
+from utils.admm import admm_block_pattern_prune, admm_loss, initialize_Z_and_U, initialize_Y_and_V, update_W, \
+    update_Z, update_U, update_Y, update_V, retrain_1_N_prune, N_prune_admm
 
 logger = logging.getLogger(__name__)
 
+# nn.Conv2d.__getstate__ = __getstate__
+# nn.Conv2d.__setstate__ = __setstate__
 
 def train(hyp, opt, device, tb_writer=None):
     logger.info(colorstr('hyperparameters: ') + ', '.join(f'{k}={v}' for k, v in hyp.items()))
     save_dir, epochs, batch_size, total_batch_size, weights, rank, freeze = \
         Path(opt.save_dir), opt.epochs, opt.batch_size, opt.total_batch_size, opt.weights, opt.global_rank, opt.freeze
-
+    print('opt.save_dir:')
+    print(opt.save_dir)
     # Directories
     wdir = save_dir / 'weights'
     wdir.mkdir(parents=True, exist_ok=True)  # make dir
-    last = wdir / 'yolov7_last_pattern_prune.pt'
-    best = wdir / 'yolov7_best_pattern_prune.pt'
+    last = wdir / 'last.pt'
+    best = wdir / 'best.pt'
     results_file = save_dir / 'results.txt'
 
     # Save run settings
@@ -82,35 +91,14 @@ def train(hyp, opt, device, tb_writer=None):
     assert len(names) == nc, '%g names found for nc=%g dataset in %s' % (len(names), nc, opt.data)  # check
 
     # Model
-    temp_pretrained = weights.endswith('.pth')
     pretrained = weights.endswith('.pt')
-    if temp_pretrained:
+    if pretrained:
         with torch_distributed_zero_first(rank):
             attempt_download(weights)  # download if not found locally
         ckpt = torch.load(weights, map_location=device)  # load checkpoint
         model = Model(opt.cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
-        add_mask(model)
-        print('opt.cfg:')
-        print(opt.cfg)
-        print(opt.cfg or ckpt['model'].yaml)
-        # print('ckpt.yaml:')
-        # print(ckpt['model'].yaml)
-        print('nc:')
-        print(nc)
-        print('hyp.get():')
-        print(hyp.get('anchors'))
-        print('hyp:')
-        print(hyp)
-        print('anchors in hyp or not:')
-        check_anchors_in_hyp = 'anchors' in hyp
-        print(check_anchors_in_hyp )
-        
-        print('!!!!!!!!!!!!!!!')
-        print('count_mask_layer(model):')
-        print(count_mask_layer(model))
         exclude = ['anchor'] if (opt.cfg or hyp.get('anchors')) and not opt.resume else []  # exclude keys
-        # state_dict = ckpt['model'].float().state_dict()  # to FP32
-        state_dict = ckpt['model']
+        state_dict = ckpt['model'].float().state_dict()  # to FP32
         state_dict = intersect_dicts(state_dict, model.state_dict(), exclude=exclude)  # intersect
         model.load_state_dict(state_dict, strict=False)  # load
         logger.info('Transferred %g/%g items from %s' % (len(state_dict), len(model.state_dict()), weights))  # report
@@ -221,7 +209,8 @@ def train(hyp, opt, device, tb_writer=None):
 
     # EMA
     ema = ModelEMA(model) if rank in [-1, 0] else None
-
+    add_mask(ema.ema)
+    
     # Resume
     start_epoch, best_fitness = 0, 0.0
     if pretrained:
@@ -327,6 +316,45 @@ def train(hyp, opt, device, tb_writer=None):
                 f'Logging results to {save_dir}\n'
                 f'Starting training for {epochs} epochs...')
     torch.save(model, wdir / 'init.pt')
+    print('==================================================')
+    print('non standard conv num:')
+    print(find_nonstandard_convs(model))
+    print('find conv layer:')
+    print(find_convs_num(model))
+    
+    N_cfg = get_N_cfg(opt.N, model)
+    pr_cfg = get_pr_cfg(opt.pr_rate, model)
+    # no pruning for first layer
+    pr_cfg[0] = 0
+    count_divisible(model, N_cfg)
+    
+    add_mask(model)
+    # print('model:')
+    # print(model, file=open('admm_model_struct.txt', 'w'))
+    
+    N_prune_admm(model, pr_cfg, N_cfg)
+    print('model device:')
+    print(next(model.parameters()).device)
+    print('device:')
+    print(device)
+    model = model.cpu()
+    
+    layer_top_k_pattern_list = layer_pattern(model, opt)
+    admm_block_pattern_prune(model, N_cfg, layer_top_k_pattern_list)
+    Z, U = initialize_Z_and_U(model)
+    Y, V = initialize_Y_and_V(model)
+    # print('layer_top_k_pattern_list[0][0]:')
+    # print(layer_top_k_pattern_list[0][0])
+    # print('layer_top_k_pattern_list[0][0].device:')
+    # print(layer_top_k_pattern_list[0][0].device)
+    
+    model = model.to(device)
+    print('model device:')
+    print(next(model.parameters()).device)
+    print('===============================')
+    print('opt.admm:')
+    print(opt.admm)
+    
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         model.train()
 
@@ -391,6 +419,8 @@ def train(hyp, opt, device, tb_writer=None):
                 if opt.quad:
                     loss *= 4.
 
+            if opt.admm:
+                loss = admm_loss(opt, device, model, Z, U, Y, V, loss)
             # Backward
             scaler.scale(loss).backward()
 
@@ -423,6 +453,12 @@ def train(hyp, opt, device, tb_writer=None):
             if i == 5:
                 break
             # end batch ------------------------------------------------------------------------------------------------
+            
+        W = update_W(model)
+        Z = update_Z(W, U, N_cfg, layer_top_k_pattern_list, model)
+        Y = update_Y(W, V, pr_cfg, N_cfg, model, Y, opt)
+        U = update_U(U, W, Z)
+        V = update_V(V, W, Y) 
         # end epoch ----------------------------------------------------------------------------------------------------
 
         # Scheduler
@@ -475,6 +511,8 @@ def train(hyp, opt, device, tb_writer=None):
 
             # Save model
             if (not opt.nosave) or (final_epoch and not opt.evolve):  # if save
+                print('is_parallel(model):')
+                print(is_parallel(model))
                 ckpt = {'epoch': epoch,
                         'best_fitness': best_fitness,
                         'training_results': results_file.read_text(),
@@ -551,7 +589,10 @@ def train(hyp, opt, device, tb_writer=None):
     else:
         dist.destroy_process_group()
     torch.cuda.empty_cache()
-    return results, model
+    if opt.admm:
+        return results, model, layer_top_k_pattern_list
+    else:
+        return results, model
 
 
 if __name__ == '__main__':
@@ -592,6 +633,12 @@ if __name__ == '__main__':
     parser.add_argument('--artifact_alias', type=str, default="latest", help='version of dataset artifact to be used')
     parser.add_argument('--freeze', nargs='+', type=int, default=[0], help='Freeze layers: backbone of yolov7=50, first3=0 1 2')
     parser.add_argument('--v5-metric', action='store_true', help='assume maximum recall as 1.0 in AP calculation')
+    parser.add_argument('--kernel_pattern_num', type=int, default=4, help='pattern num')
+    parser.add_argument('--admm', action='store_true', help='admm train or not')
+    parser.add_argument('--pr_rate', type=float, default=0.5, help='pruning rate')
+    parser.add_argument('--N', type=int, default=4, help='block size')
+    parser.add_argument('--block_pattern_prune', action='store_true', help='block pattern prune or not')
+    parser.add_argument('--rho', type=float, default=0.01, help='rho for admm')
     opt = parser.parse_args()
 
     # Set DDP variables
@@ -643,7 +690,8 @@ if __name__ == '__main__':
             prefix = colorstr('tensorboard: ')
             logger.info(f"{prefix}Start with 'tensorboard --logdir {opt.project}', view at http://localhost:6006/")
             tb_writer = SummaryWriter(opt.save_dir)  # Tensorboard
-        _, model = train(hyp, opt, device, tb_writer)
+        print('\n==> Call train function from here (not evolve)..\n')
+        _, model, layer_top_k_pattern_list = train(hyp, opt, device, tb_writer)
 
     # Evolve hyperparameters (optional)
     else:
@@ -724,7 +772,8 @@ if __name__ == '__main__':
                 hyp[k] = round(hyp[k], 5)  # significant digits
 
             # Train mutation
-            results, model = train(hyp.copy(), opt, device)
+            print('\n==> Call train function from here(mutation)..\n')
+            results = train(hyp.copy(), opt, device)
 
             # Write mutation results
             print_mutation(hyp.copy(), results, yaml_file, opt.bucket)
@@ -733,17 +782,25 @@ if __name__ == '__main__':
         plot_evolution(yaml_file)
         print(f'Hyperparameter evolution complete. Best results saved as: {yaml_file}\n'
               f'Command to train a new model with these hyperparameters: $ python train.py --hyp {yaml_file}')
+        
     wdir = Path(opt.save_dir) / 'weights'
-    best_model_path = f"{wdir}/yolov7_best_pattern_prune.pt"
-    
+    print('wdir:')
+    print(wdir)
+    best_model_path = f"{wdir}/best.pt"
+    print('device:')
+    print(device)
+    print('======================')
     model = attempt_load(model, best_model_path, map_location=device)  # load FP32 model
-    # best_model_path_pruned = f"{wdir}/admm_yolov7_pattern_prune.pth"
-    # ckpt = {'model': state_dict_half((model.module if is_parallel(model) else model).state_dict())}
+    
+    model = model.cpu()
+    N_cfg = get_N_cfg(opt.N, model)
+    pr_cfg = get_pr_cfg(opt.pr_rate, model)
+    block_pattern_prune(model, opt, layer_top_k_pattern_list, N_cfg)
+    retrain_1_N_prune(model, opt, layer_top_k_pattern_list, pr_cfg, N_cfg)
+    
+    best_model_path_pruned = f"{wdir}/admm_yolov7_best_pruned.pth"
+    
+    ckpt = {'model': state_dict_half((model.module if is_parallel(model) else model).state_dict())}
     
     # Save last, best and delete
-    # torch.save(ckpt, best_model_path)
-    # print('model:')
-    # print(model, file=open('retrain_struct.txt', 'w'))
-    model = model.cpu()
-    check_pattern_layer(model, 4)
-    check_block_pattern(model, 4)
+    torch.save(ckpt, best_model_path_pruned)

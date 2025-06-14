@@ -34,8 +34,6 @@ from utils.loss import ComputeLoss, ComputeLossOTA
 from utils.plots import plot_images, plot_labels, plot_results, plot_evolution
 from utils.torch_utils import ModelEMA, select_device, intersect_dicts, torch_distributed_zero_first, is_parallel
 from utils.wandb_logging.wandb_utils import WandbLogger, check_wandb_resume
-from utils.pattern_utils import conv2d_forward_with_mask, add_mask, count_mask_layer, state_dict_half
-from check_pattern import check_pattern_layer, check_block_pattern
 
 logger = logging.getLogger(__name__)
 
@@ -48,8 +46,8 @@ def train(hyp, opt, device, tb_writer=None):
     # Directories
     wdir = save_dir / 'weights'
     wdir.mkdir(parents=True, exist_ok=True)  # make dir
-    last = wdir / 'yolov7_last_pattern_prune.pt'
-    best = wdir / 'yolov7_best_pattern_prune.pt'
+    last = wdir / 'last.pt'
+    best = wdir / 'best.pt'
     results_file = save_dir / 'results.txt'
 
     # Save run settings
@@ -82,35 +80,21 @@ def train(hyp, opt, device, tb_writer=None):
     assert len(names) == nc, '%g names found for nc=%g dataset in %s' % (len(names), nc, opt.data)  # check
 
     # Model
-    temp_pretrained = weights.endswith('.pth')
     pretrained = weights.endswith('.pt')
-    if temp_pretrained:
+    if pretrained:
         with torch_distributed_zero_first(rank):
             attempt_download(weights)  # download if not found locally
         ckpt = torch.load(weights, map_location=device)  # load checkpoint
         model = Model(opt.cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
-        add_mask(model)
-        print('opt.cfg:')
-        print(opt.cfg)
-        print(opt.cfg or ckpt['model'].yaml)
-        # print('ckpt.yaml:')
-        # print(ckpt['model'].yaml)
-        print('nc:')
-        print(nc)
-        print('hyp.get():')
-        print(hyp.get('anchors'))
         print('hyp:')
         print(hyp)
         print('anchors in hyp or not:')
         check_anchors_in_hyp = 'anchors' in hyp
         print(check_anchors_in_hyp )
-        
-        print('!!!!!!!!!!!!!!!')
-        print('count_mask_layer(model):')
-        print(count_mask_layer(model))
+        print('hyp.get():')
+        print(hyp.get('anchors'))
         exclude = ['anchor'] if (opt.cfg or hyp.get('anchors')) and not opt.resume else []  # exclude keys
-        # state_dict = ckpt['model'].float().state_dict()  # to FP32
-        state_dict = ckpt['model']
+        state_dict = ckpt['model'].float().state_dict()  # to FP32
         state_dict = intersect_dicts(state_dict, model.state_dict(), exclude=exclude)  # intersect
         model.load_state_dict(state_dict, strict=False)  # load
         logger.info('Transferred %g/%g items from %s' % (len(state_dict), len(model.state_dict()), weights))  # report
@@ -420,8 +404,7 @@ def train(hyp, opt, device, tb_writer=None):
                 elif plots and ni == 10 and wandb_logger.wandb:
                     wandb_logger.log({"Mosaics": [wandb_logger.wandb.Image(str(x), caption=x.name) for x in
                                                   save_dir.glob('train*.jpg') if x.exists()]})
-            if i == 5:
-                break
+
             # end batch ------------------------------------------------------------------------------------------------
         # end epoch ----------------------------------------------------------------------------------------------------
 
@@ -436,7 +419,7 @@ def train(hyp, opt, device, tb_writer=None):
             final_epoch = epoch + 1 == epochs
             if not opt.notest or final_epoch:  # Calculate mAP
                 wandb_logger.current_epoch = epoch + 1
-                results, maps, times, _ = test.test(data_dict,
+                results, maps, times = test.test(data_dict,
                                                  batch_size=batch_size * 2,
                                                  imgsz=imgsz_test,
                                                  model=ema.ema,
@@ -478,10 +461,8 @@ def train(hyp, opt, device, tb_writer=None):
                 ckpt = {'epoch': epoch,
                         'best_fitness': best_fitness,
                         'training_results': results_file.read_text(),
-                        # 'model': deepcopy(model.module if is_parallel(model) else model).half(),
-                        'model': state_dict_half((model.module if is_parallel(model) else model).state_dict()),
-                        # 'ema': deepcopy(ema.ema).half(),
-                        'ema': state_dict_half(ema.ema.state_dict()),
+                        'model': deepcopy(model.module if is_parallel(model) else model).half(),
+                        'ema': deepcopy(ema.ema).half(),
                         'updates': ema.updates,
                         'optimizer': optimizer.state_dict(),
                         'wandb_id': wandb_logger.wandb_run.id if wandb_logger.wandb else None}
@@ -518,16 +499,12 @@ def train(hyp, opt, device, tb_writer=None):
         logger.info('%g epochs completed in %.3f hours.\n' % (epoch - start_epoch + 1, (time.time() - t0) / 3600))
         if opt.data.endswith('coco.yaml') and nc == 80:  # if COCO
             for m in (last, best) if best.exists() else (last):  # speed, mAP tests
-                print('count_mask_layer(model):')
-                print(count_mask_layer(model))
-                print('count_mask_layer(ema.ema):')
-                print(count_mask_layer(ema.ema))
-                results, _, _, _ = test.test(opt.data,
+                results, _, _ = test.test(opt.data,
                                           batch_size=batch_size * 2,
                                           imgsz=imgsz_test,
                                           conf_thres=0.001,
                                           iou_thres=0.7,
-                                          model=attempt_load(model, m, device).half(),
+                                          model=attempt_load(m, device).half(),
                                           single_cls=opt.single_cls,
                                           dataloader=testloader,
                                           save_dir=save_dir,
@@ -540,7 +517,7 @@ def train(hyp, opt, device, tb_writer=None):
         final = best if best.exists() else last  # final model
         for f in last, best:
             if f.exists():
-                strip_optimizer(model, f)  # strip optimizers
+                strip_optimizer(f)  # strip optimizers
         if opt.bucket:
             os.system(f'gsutil cp {final} gs://{opt.bucket}/weights')  # upload
         if wandb_logger.wandb and not opt.evolve:  # Log the stripped model
@@ -551,7 +528,7 @@ def train(hyp, opt, device, tb_writer=None):
     else:
         dist.destroy_process_group()
     torch.cuda.empty_cache()
-    return results, model
+    return results
 
 
 if __name__ == '__main__':
@@ -643,7 +620,7 @@ if __name__ == '__main__':
             prefix = colorstr('tensorboard: ')
             logger.info(f"{prefix}Start with 'tensorboard --logdir {opt.project}', view at http://localhost:6006/")
             tb_writer = SummaryWriter(opt.save_dir)  # Tensorboard
-        _, model = train(hyp, opt, device, tb_writer)
+        train(hyp, opt, device, tb_writer)
 
     # Evolve hyperparameters (optional)
     else:
@@ -724,7 +701,7 @@ if __name__ == '__main__':
                 hyp[k] = round(hyp[k], 5)  # significant digits
 
             # Train mutation
-            results, model = train(hyp.copy(), opt, device)
+            results = train(hyp.copy(), opt, device)
 
             # Write mutation results
             print_mutation(hyp.copy(), results, yaml_file, opt.bucket)
@@ -733,17 +710,3 @@ if __name__ == '__main__':
         plot_evolution(yaml_file)
         print(f'Hyperparameter evolution complete. Best results saved as: {yaml_file}\n'
               f'Command to train a new model with these hyperparameters: $ python train.py --hyp {yaml_file}')
-    wdir = Path(opt.save_dir) / 'weights'
-    best_model_path = f"{wdir}/yolov7_best_pattern_prune.pt"
-    
-    model = attempt_load(model, best_model_path, map_location=device)  # load FP32 model
-    # best_model_path_pruned = f"{wdir}/admm_yolov7_pattern_prune.pth"
-    # ckpt = {'model': state_dict_half((model.module if is_parallel(model) else model).state_dict())}
-    
-    # Save last, best and delete
-    # torch.save(ckpt, best_model_path)
-    # print('model:')
-    # print(model, file=open('retrain_struct.txt', 'w'))
-    model = model.cpu()
-    check_pattern_layer(model, 4)
-    check_block_pattern(model, 4)
