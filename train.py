@@ -420,8 +420,8 @@ def train(hyp, opt, device, tb_writer=None):
                 elif plots and ni == 10 and wandb_logger.wandb:
                     wandb_logger.log({"Mosaics": [wandb_logger.wandb.Image(str(x), caption=x.name) for x in
                                                   save_dir.glob('train*.jpg') if x.exists()]})
-            if i == 5:
-                break
+            # if i == 5:
+            #     break
             # end batch ------------------------------------------------------------------------------------------------
         # end epoch ----------------------------------------------------------------------------------------------------
 
@@ -592,6 +592,9 @@ if __name__ == '__main__':
     parser.add_argument('--artifact_alias', type=str, default="latest", help='version of dataset artifact to be used')
     parser.add_argument('--freeze', nargs='+', type=int, default=[0], help='Freeze layers: backbone of yolov7=50, first3=0 1 2')
     parser.add_argument('--v5-metric', action='store_true', help='assume maximum recall as 1.0 in AP calculation')
+    parser.add_argument('--only_1_N_prune', action='store_true', help='only 1xN prune')
+    parser.add_argument('--pr_rate', type=float, default=0.5, help='pruning rate')
+    parser.add_argument('--N', type=int, default=4, help='block size')
     opt = parser.parse_args()
 
     # Set DDP variables
@@ -745,5 +748,5 @@ if __name__ == '__main__':
     # print('model:')
     # print(model, file=open('retrain_struct.txt', 'w'))
     model = model.cpu()
-    check_pattern_layer(model, 4)
-    check_block_pattern(model, 4)
+    check_pattern_layer(model, opt.N, opt.only_1_N_prune)
+    check_block_pattern(model, opt.N, opt.only_1_N_prune)

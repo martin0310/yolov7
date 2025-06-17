@@ -8,7 +8,7 @@ import torch.nn as nn
 from models.experimental import attempt_load
 from utils.pattern_utils import find_convs_num
 
-def check_block_pattern(model, N):
+def check_block_pattern(model, N, only_1_N_prune):
     print('check_block_pattern =============>')
 
     N_cfg = [N] * find_convs_num(model)
@@ -28,11 +28,14 @@ def check_block_pattern(model, N):
                 if module.weight.shape[-2:] == (3, 3):
                     for i in range(module.mask.size(1)):
                         for j in range(0, module.mask.size(0), N_cfg[conv_layer_index]):
-                            if (module.mask[j][i] == 1).sum().item() == 4:
+                            if (module.mask[j][i] == 1).sum().item() == 4 and not only_1_N_prune:
                                 for index in range(1, N_cfg[conv_layer_index]):
                                     if not torch.equal(module.mask[j][i], module.mask[j + index][i]):
                                         raise Exception("block pattern error!!!")
-                                    
+                            elif (module.mask[j][i] == 1).sum().item() == 9 and only_1_N_prune:
+                                for index in range(1, N_cfg[conv_layer_index]):
+                                    if not torch.equal(module.mask[j][i], module.mask[j + index][i]):
+                                        raise Exception("block pattern error!!!")
 
                 if module.weight.shape[-2:] == (1, 1):
                     if module.weight.shape[0] % N_cfg[conv_layer_index] != 0:
@@ -60,7 +63,7 @@ def check_block_pattern(model, N):
     print(zero_in_1_1_kernel_count)
 
 
-def check_pattern_layer(model, kernel_pattern_num):
+def check_pattern_layer(model, kernel_pattern_num, only_1_N_prune):
     print('==> enter check_pattern_layer..')
 
     total_kernel_count = 0
@@ -111,7 +114,7 @@ def check_pattern_layer(model, kernel_pattern_num):
                                 all_one_kernel_count += 1
                     layer = layer + 1
                     
-                    if kernel_pattern_num != len(mask_patterns):
+                    if kernel_pattern_num != len(mask_patterns) and not only_1_N_prune:
                         print('layer:')
                         print(layer)
                         
@@ -122,7 +125,7 @@ def check_pattern_layer(model, kernel_pattern_num):
                         print('all_one_kernel_count:')
                         print(all_one_kernel_count)
 
-                        if len(mask_patterns) == 0:
+                        if len(mask_patterns) == 0 and not only_1_N_prune:
                             print('error!!!!!!!!!!')
                             raise Exception("pattern format error!!!")
     print('total_kernel_count:')
@@ -145,6 +148,7 @@ if __name__ == '__main__':
     parser.add_argument('--kernel_pattern_num', type=int, default=4, help='pattern num')
     parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     parser.add_argument('--N', type=int, default=4, help='block size')
+    parser.add_argument('--only_1_N_prune', action='store_true', help='only 1xN prune')
     opt = parser.parse_args()
     
     device = torch.device(f"cuda:{opt.device}" if torch.cuda.is_available() else "cpu")
@@ -155,8 +159,8 @@ if __name__ == '__main__':
     
     add_mask(model)
     
-    check_pattern_layer(model, opt.kernel_pattern_num)
+    check_pattern_layer(model, opt.kernel_pattern_num, opt.only_1_N_prune)
     
-    check_block_pattern(model, opt.N)
+    check_block_pattern(model, opt.N, opt.only_1_N_prune)
     
     
